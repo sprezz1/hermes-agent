@@ -22,7 +22,9 @@ from plugins.memory.hindsight import (
     RETAIN_SCHEMA,
     _load_config,
     _build_embedded_profile_env,
+    _normalize_bank_routes,
     _normalize_retain_tags,
+    _resolve_bank_route,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
@@ -1282,7 +1284,8 @@ class TestConfigSchema:
         keys = {f["key"] for f in schema}
         expected_keys = {
             "mode", "api_url", "api_key", "llm_provider", "llm_api_key",
-            "llm_model", "bank_id", "bank_id_template", "bank_mission", "bank_retain_mission",
+            "llm_model", "bank_id", "bank_routes", "bank_id_template",
+            "bank_mission", "bank_retain_mission",
             "recall_budget", "memory_mode", "recall_prefetch_method",
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
@@ -1335,6 +1338,16 @@ class TestBankIdTemplate:
             user="", session="",
         )
         assert result == "myorg-coder-cli"
+
+    def test_resolve_with_chat_and_thread_placeholders(self):
+        result = _resolve_bank_id_template(
+            "room-{platform}-{chat}-{thread}",
+            fallback="hermes",
+            profile="", workspace="", platform="matrix", user="", session="",
+            chat="!abc:kingdom.local", room="!abc:kingdom.local",
+            thread="$topic",
+        )
+        assert result == "room-matrix-abc-kingdom-local-topic"
 
     def test_resolve_collapses_empty_placeholders(self):
         # When user is empty, "hermes-{user}" becomes "hermes-" -> trimmed to "hermes"
@@ -1437,6 +1450,116 @@ class TestBankIdTemplate:
         # No agent_identity passed — template renders to "hermes-" which collapses to "hermes"
         p.initialize(session_id="s1", hermes_home=str(tmp_path), platform="cli")
         assert p._bank_id == "hermes"
+
+
+class TestBankRoutes:
+    def test_normalize_bank_routes_sanitizes_bank_names(self):
+        routes = _normalize_bank_routes({"matrix:!room:server": "Astra Sanctuary!"})
+        assert routes == {"matrix:!room:server": "Astra-Sanctuary"}
+
+    def test_normalize_bank_routes_rejects_non_mapping(self):
+        assert _normalize_bank_routes(["not", "a", "mapping"]) == {}
+
+    def test_resolve_bank_route_matches_raw_chat_id(self):
+        routes = {"!room:kingdom.local": "astra_sanctuary"}
+        assert _resolve_bank_route(
+            routes,
+            "hermes_legacy",
+            platform="matrix",
+            chat="!room:kingdom.local",
+        ) == "astra_sanctuary"
+
+    def test_resolve_bank_route_prefers_platform_specific_key(self):
+        routes = {
+            "!room:kingdom.local": "generic_room",
+            "matrix:!room:kingdom.local": "astra_sanctuary",
+        }
+        assert _resolve_bank_route(
+            routes,
+            "hermes_legacy",
+            platform="matrix",
+            chat="!room:kingdom.local",
+        ) == "astra_sanctuary"
+
+    def test_resolve_bank_route_prefers_thread_specific_key(self):
+        routes = {
+            "matrix:!room:kingdom.local": "astra_sanctuary",
+            "matrix:!room:kingdom.local:$thread": "astra_thread",
+        }
+        assert _resolve_bank_route(
+            routes,
+            "hermes_legacy",
+            platform="matrix",
+            chat="!room:kingdom.local",
+            thread="$thread",
+        ) == "astra_thread"
+
+    def test_resolve_bank_route_accepts_sanitized_key(self):
+        routes = {"matrix:room-kingdom-local": "astra_sanctuary"}
+        assert _resolve_bank_route(
+            routes,
+            "hermes_legacy",
+            platform="matrix",
+            chat="!room:kingdom.local",
+        ) == "astra_sanctuary"
+
+    def test_resolve_bank_route_uses_default_route(self):
+        assert _resolve_bank_route(
+            {"default": "astra_main"},
+            "hermes_legacy",
+            platform="matrix",
+            chat="!room:kingdom.local",
+        ) == "astra_main"
+
+    def test_provider_uses_bank_route_before_template(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "k",
+            "api_url": "http://x",
+            "bank_id": "hermes_legacy",
+            "bank_id_template": "template-{chat}",
+            "bank_routes": {
+                "matrix:!QciTuSXGfxseWDesXs:kingdom.local": "astra_sanctuary",
+            },
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="matrix",
+            chat_id="!QciTuSXGfxseWDesXs:kingdom.local",
+        )
+        assert p._bank_id == "astra_sanctuary"
+
+    def test_provider_falls_back_to_template_without_route(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "k",
+            "api_url": "http://x",
+            "bank_id": "hermes_legacy",
+            "bank_id_template": "template-{chat}",
+            "bank_routes": {
+                "matrix:!other:kingdom.local": "astra_sanctuary",
+            },
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="matrix",
+            chat_id="!room:kingdom.local",
+        )
+        assert p._bank_id == "template-room-kingdom-local"
 
 
 # ---------------------------------------------------------------------------

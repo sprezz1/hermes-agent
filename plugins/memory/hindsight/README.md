@@ -59,8 +59,9 @@ Config file: `~/.hermes/hindsight/config.json`
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
-| `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{platform}`, `{user}`, `{session}`. Example: `hermes-{profile}` isolates memory per active Hermes profile. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
+| `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_routes` and `bank_id_template` do not match) |
+| `bank_routes` | — | Optional map from current room/channel IDs to semantic bank names. Route keys may be raw chat IDs, platform-prefixed IDs, or `platform:chat:thread`; values are bank IDs such as `astra_work`. Routes take precedence over templates. |
+| `bank_id_template` | — | Optional template to derive the bank name dynamically when no `bank_routes` entry matches. Placeholders: `{profile}`, `{workspace}`, `{platform}`, `{user}`, `{session}`, `{chat}`, `{room}`, `{thread}`. Example: `hermes-{profile}` isolates memory per active Hermes profile. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
 | `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Banks API. |
 | `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Banks API. |
 

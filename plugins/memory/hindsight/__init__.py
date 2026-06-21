@@ -487,6 +487,9 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
       {platform}  — "cli", "telegram", "discord", etc.
       {user}      — platform user id (gateway sessions)
       {session}   — current session id
+      {chat}      — platform chat/channel/room id (gateway sessions)
+      {room}      — alias for {chat}
+      {thread}    — platform thread/topic id (gateway sessions)
 
     Missing/empty placeholders are rendered as the empty string and then
     collapsed — e.g. ``hermes-{user}`` with no user becomes ``hermes``.
@@ -511,6 +514,78 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
     return rendered or fallback
 
 
+def _normalize_bank_routes(value: Any) -> dict[str, str]:
+    """Return a cleaned mapping of route keys to safe bank ids."""
+    if not value:
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("Invalid Hindsight bank_routes %r — expected object", value)
+        return {}
+    routes: dict[str, str] = {}
+    for raw_key, raw_bank in value.items():
+        key = str(raw_key or "").strip()
+        bank_id = _sanitize_bank_segment(raw_bank)
+        if key and bank_id:
+            routes[key] = bank_id
+    return routes
+
+
+def _bank_route_candidates(platform: str = "", chat: str = "", thread: str = "") -> list[str]:
+    """Return route keys from most-specific to broadest.
+
+    Configs may use raw gateway IDs (``matrix:!room:server``) or sanitized
+    variants (``matrix:room-server``). Raw IDs are preferred because they are
+    lossless; sanitized keys are only a convenience for hand-written configs.
+    """
+    raw_platform = str(platform or "").strip()
+    raw_chat = str(chat or "").strip()
+    raw_thread = str(thread or "").strip()
+    clean_platform = _sanitize_bank_segment(raw_platform)
+    clean_chat = _sanitize_bank_segment(raw_chat)
+    clean_thread = _sanitize_bank_segment(raw_thread)
+
+    candidates: list[str] = []
+
+    def add(*parts: str) -> None:
+        key = ":".join(str(p) for p in parts if str(p))
+        if key and key not in candidates:
+            candidates.append(key)
+
+    if raw_chat and raw_thread:
+        add(raw_platform, raw_chat, raw_thread)
+        add(raw_chat, raw_thread)
+    if clean_chat and clean_thread:
+        add(clean_platform, clean_chat, clean_thread)
+        add(clean_chat, clean_thread)
+    if raw_chat:
+        add(raw_platform, raw_chat)
+        add(raw_chat)
+    if clean_chat:
+        add(clean_platform, clean_chat)
+        add(clean_chat)
+    add("default")
+    add("*")
+    return candidates
+
+
+def _resolve_bank_route(
+    routes: dict[str, str],
+    fallback: str,
+    *,
+    platform: str = "",
+    chat: str = "",
+    thread: str = "",
+) -> str:
+    """Resolve an explicit semantic bank route, falling back if none match."""
+    if not routes:
+        return fallback
+    for key in _bank_route_candidates(platform=platform, chat=chat, thread=thread):
+        bank_id = routes.get(key)
+        if bank_id:
+            return bank_id
+    return fallback
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -523,6 +598,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._api_key = None
         self._api_url = _DEFAULT_API_URL
         self._bank_id = "hermes"
+        self._bank_routes: dict[str, str] = {}
         self._budget = "mid"
         self._mode = "cloud"
         self._llm_base_url = ""
@@ -857,8 +933,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_base_url", "description": "Endpoint URL (e.g. http://192.168.1.10:8080/v1)", "default": "", "when": {"mode": "local_embedded", "llm_provider": "openai_compatible"}},
             {"key": "llm_api_key", "description": "LLM API key (optional for openai_compatible)", "secret": True, "env_var": "HINDSIGHT_LLM_API_KEY", "when": {"mode": "local_embedded"}},
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
-            {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
-            {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
+            {"key": "bank_id", "description": "Memory bank name (static fallback when bank_routes and bank_id_template do not match)", "default": "hermes"},
+            {"key": "bank_routes", "description": "Optional map of current room/channel IDs to semantic bank IDs. Keys may be raw chat IDs, platform-prefixed IDs, or most-specific platform:chat:thread keys. Example: {\"matrix:!room:server\": \"astra_work\"}", "default": {}},
+            {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically when bank_routes does not match. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}, {chat}, {room}, {thread}. Example: hermes-{profile}", "default": ""},
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
@@ -1155,8 +1232,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
         banks = cfg_get(self._config, "banks", "hermes", default={})
         static_bank_id = self._config.get("bank_id") or banks.get("bankId", "hermes")
+        self._bank_routes = _normalize_bank_routes(self._config.get("bank_routes"))
         self._bank_id_template = self._config.get("bank_id_template", "") or ""
-        self._bank_id = _resolve_bank_id_template(
+        template_bank_id = _resolve_bank_id_template(
             self._bank_id_template,
             fallback=static_bank_id,
             profile=self._agent_identity,
@@ -1164,6 +1242,16 @@ class HindsightMemoryProvider(MemoryProvider):
             platform=self._platform,
             user=self._user_id,
             session=self._session_id,
+            chat=self._chat_id,
+            room=self._chat_id,
+            thread=self._thread_id,
+        )
+        self._bank_id = _resolve_bank_route(
+            self._bank_routes,
+            fallback=template_bank_id,
+            platform=self._platform,
+            chat=self._chat_id,
+            thread=self._thread_id,
         )
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
@@ -1231,6 +1319,11 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Hindsight bank resolved from template %r: profile=%s workspace=%s platform=%s user=%s -> bank=%s",
                          self._bank_id_template, self._agent_identity, self._agent_workspace,
                          self._platform, self._user_id, self._bank_id)
+        if self._bank_routes:
+            logger.debug(
+                "Hindsight bank routes enabled: platform=%s chat=%s thread=%s -> bank=%s",
+                self._platform, self._chat_id, self._thread_id, self._bank_id,
+            )
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
                      "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
