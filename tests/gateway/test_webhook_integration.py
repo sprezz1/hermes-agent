@@ -262,6 +262,71 @@ class TestCrossPlatformDelivery:
         # don't strand the final response (TTL-based cleanup happens on POST).
         assert chat_id in adapter._delivery_info
 
+    @pytest.mark.asyncio
+    async def test_agent_mode_background_response_honors_matrix_delivery(self):
+        """The full adapter send path must honor webhook deliver metadata.
+
+        This covers the production path for webhook-triggered agent turns:
+        POST stores delivery_info, BasePlatformAdapter runs the handler in the
+        background, and the final response is sent back through
+        WebhookAdapter.send().  A webhook response must not fall through to a
+        configured Telegram home channel just because Telegram is also
+        connected.
+        """
+        routes = {
+            "astra-wake": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Wake: {message}",
+                "deliver": "matrix",
+                "deliver_extra": {"chat_id": "!room:kingdom.local"},
+            }
+        }
+        adapter = _make_adapter(routes)
+
+        async def _handler(event: MessageEvent):
+            assert event.source.platform == Platform.WEBHOOK
+            assert event.source.chat_id == "webhook:astra-wake:wake-001"
+            return "I saw the wake."
+
+        adapter.set_message_handler(_handler)
+
+        mock_matrix_adapter = AsyncMock()
+        mock_matrix_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_telegram_adapter = AsyncMock()
+        mock_telegram_adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+        mock_runner = MagicMock()
+        mock_runner.adapters = {
+            Platform.MATRIX: mock_matrix_adapter,
+            Platform.TELEGRAM: mock_telegram_adapter,
+        }
+        mock_runner.config = GatewayConfig(
+            platforms={
+                Platform.MATRIX: PlatformConfig(enabled=True, token="fake"),
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
+            }
+        )
+        adapter.gateway_runner = mock_runner
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/astra-wake",
+                json={"message": "new place"},
+                headers={"X-GitHub-Delivery": "wake-001"},
+            )
+            assert resp.status == 202
+
+        for _ in range(100):
+            if mock_matrix_adapter.send.await_count:
+                break
+            await asyncio.sleep(0.01)
+
+        mock_matrix_adapter.send.assert_awaited_once_with(
+            "!room:kingdom.local", "I saw the wake.", metadata=None
+        )
+        mock_telegram_adapter.send.assert_not_awaited()
+
 
 # ===================================================================
 # Test 4: GitHub comment delivery via gh CLI

@@ -240,6 +240,153 @@ class TestSendMessageTool:
         send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
 
+    def test_webhook_home_target_send_is_skipped_and_explained(self):
+        telegram_home = SimpleNamespace(chat_id="-1001")
+        matrix_cfg = SimpleNamespace(enabled=True, token="matrix-token", extra={})
+        config, _telegram_cfg = _make_config()
+        config.platforms[Platform.MATRIX] = matrix_cfg
+        config.get_home_channel = lambda platform: (
+            telegram_home if platform == Platform.TELEGRAM else None
+        )
+        session_chat_id = "webhook:astra-wake:wake-001"
+        webhook_adapter = SimpleNamespace(_delivery_info={
+            session_chat_id: {
+                "deliver": "matrix",
+                "deliver_extra": {"chat_id": "!room:kingdom.local"},
+            }
+        })
+        runner = SimpleNamespace(
+            adapters={Platform.WEBHOOK: webhook_adapter},
+            config=config,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "webhook",
+                "HERMES_SESSION_CHAT_ID": session_chat_id,
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram",
+                        "message": "wake delivered",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "webhook_auto_delivery_home_target"
+        assert result["target"] == "telegram:-1001"
+        assert result["auto_delivery_target"] == "matrix:!room:kingdom.local"
+        assert "final response" in result["note"]
+        send_mock.assert_not_awaited()
+        mirror_mock.assert_not_called()
+
+    def test_webhook_duplicate_delivery_target_is_skipped_and_explained(self):
+        matrix_cfg = SimpleNamespace(enabled=True, token="matrix-token", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.MATRIX: matrix_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        session_chat_id = "webhook:astra-wake:wake-001"
+        webhook_adapter = SimpleNamespace(_delivery_info={
+            session_chat_id: {
+                "deliver": "matrix",
+                "deliver_extra": {"chat_id": "!room:kingdom.local"},
+            }
+        })
+        runner = SimpleNamespace(
+            adapters={Platform.WEBHOOK: webhook_adapter},
+            config=config,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "webhook",
+                "HERMES_SESSION_CHAT_ID": session_chat_id,
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "matrix:!room:kingdom.local",
+                        "message": "wake delivered",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "webhook_auto_delivery_duplicate_target"
+        assert result["target"] == "matrix:!room:kingdom.local"
+        assert result["auto_delivery_target"] == "matrix:!room:kingdom.local"
+        send_mock.assert_not_awaited()
+        mirror_mock.assert_not_called()
+
+    def test_webhook_explicit_different_target_is_allowed(self):
+        matrix_cfg = SimpleNamespace(enabled=True, token="matrix-token", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.MATRIX: matrix_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        session_chat_id = "webhook:astra-wake:wake-001"
+        webhook_adapter = SimpleNamespace(_delivery_info={
+            session_chat_id: {
+                "deliver": "matrix",
+                "deliver_extra": {"chat_id": "!room:kingdom.local"},
+            }
+        })
+        runner = SimpleNamespace(
+            adapters={Platform.WEBHOOK: webhook_adapter},
+            config=config,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "webhook",
+                "HERMES_SESSION_CHAT_ID": session_chat_id,
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "matrix:!other:kingdom.local",
+                        "message": "side channel",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.MATRIX,
+            matrix_cfg,
+            "!other:kingdom.local",
+            "side channel",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
     def test_resolved_telegram_topic_name_preserves_thread_id(self):
         config, telegram_cfg = _make_config()
 

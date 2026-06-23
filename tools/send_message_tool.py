@@ -287,6 +287,15 @@ def _handle_send(args):
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
+    webhook_skip = _maybe_skip_webhook_auto_delivery_send(
+        platform_name,
+        chat_id,
+        thread_id,
+        used_home_channel=used_home_channel,
+    )
+    if webhook_skip:
+        return json.dumps(webhook_skip)
+
     # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
@@ -481,6 +490,139 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
             f"Skipped send_message to {target_label}. This cron job will already auto-deliver "
             "its final response to that same target. Put the intended user-facing content in "
             "your final response instead, or use a different target if you want an additional message."
+        ),
+    }
+
+
+def _get_webhook_auto_delivery_target():
+    """Return the webhook route's auto-delivery target for the current turn."""
+    try:
+        from gateway.session_context import get_session_env
+        session_platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+        session_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    except Exception:
+        return None
+
+    if session_platform != "webhook" or not session_chat_id.startswith("webhook:"):
+        return None
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        return None
+
+    if runner is None:
+        return None
+
+    try:
+        webhook_adapter = runner.adapters.get(Platform.WEBHOOK)
+        delivery = getattr(webhook_adapter, "_delivery_info", {}).get(session_chat_id)
+    except Exception:
+        delivery = None
+
+    if not delivery:
+        return None
+
+    platform_name = str(delivery.get("deliver") or "").strip().lower()
+    if not platform_name or platform_name in {"log", "github_comment"}:
+        return None
+
+    extra = delivery.get("deliver_extra") or {}
+    chat_id = str(extra.get("chat_id") or "").strip()
+    thread_id = (
+        extra.get("message_thread_id")
+        or extra.get("thread_id")
+        or extra.get("topic_id")
+        or None
+    )
+    if thread_id is not None:
+        thread_id = str(thread_id)
+
+    if not chat_id:
+        try:
+            platform = Platform(platform_name)
+            home = runner.config.get_home_channel(platform)
+            if home:
+                chat_id = str(home.chat_id)
+        except Exception:
+            chat_id = ""
+
+    if not chat_id:
+        return None
+
+    return {
+        "platform": platform_name,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+    }
+
+
+def _target_label(platform_name: str, chat_id: str, thread_id: str | None = None) -> str:
+    label = f"{platform_name}:{chat_id}"
+    if thread_id is not None:
+        label += f":{thread_id}"
+    return label
+
+
+def _same_target(
+    target: dict,
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None = None,
+) -> bool:
+    return (
+        target["platform"] == platform_name
+        and str(target["chat_id"]) == str(chat_id)
+        and target.get("thread_id") == thread_id
+    )
+
+
+def _maybe_skip_webhook_auto_delivery_send(
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+    *,
+    used_home_channel: bool,
+):
+    """Skip self-delivery sends from webhook turns.
+
+    A webhook route owns delivery of the final response. Bare platform sends
+    inside that turn are ambiguous home-channel sends and can bypass the route's
+    configured Matrix/Telegram/etc. target.
+    """
+    auto_target = _get_webhook_auto_delivery_target()
+    if not auto_target:
+        return None
+
+    same_target = _same_target(auto_target, platform_name, chat_id, thread_id)
+    if not same_target and not used_home_channel:
+        return None
+
+    requested_label = _target_label(platform_name, chat_id, thread_id)
+    auto_label = _target_label(
+        auto_target["platform"],
+        auto_target["chat_id"],
+        auto_target.get("thread_id"),
+    )
+    reason = (
+        "webhook_auto_delivery_duplicate_target"
+        if same_target
+        else "webhook_auto_delivery_home_target"
+    )
+
+    return {
+        "success": True,
+        "skipped": True,
+        "reason": reason,
+        "target": requested_label,
+        "auto_delivery_target": auto_label,
+        "note": (
+            f"Skipped send_message to {requested_label}. This webhook turn will already "
+            f"auto-deliver its final response to {auto_label}. Put the intended "
+            "user-facing content in your final response instead, or use a specific "
+            "non-home target if you want an additional message."
         ),
     }
 
