@@ -7,6 +7,7 @@ the `zulip` Python SDK while using the same bot email/API-key credentials.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -155,7 +156,7 @@ class ZulipAdapter(BasePlatformAdapter):
         self._last_event_id: Optional[int] = None
         self._own_user_id: Optional[int] = None
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not HTTPX_AVAILABLE:
             logger.warning("Zulip: httpx is not installed")
             return False
@@ -172,7 +173,7 @@ class ZulipAdapter(BasePlatformAdapter):
         try:
             me = await self._request("GET", "/api/v1/users/me")
             self._own_user_id = int(me.get("user_id"))
-            registered = await self._request("POST", "/api/v1/register", data={"event_types": EVENT_TYPES})
+            registered = await self._request("POST", "/api/v1/register", data={"event_types": json.dumps(EVENT_TYPES)})
             self._queue_id = registered["queue_id"]
             self._last_event_id = int(registered["last_event_id"])
         except Exception as e:
@@ -180,8 +181,8 @@ class ZulipAdapter(BasePlatformAdapter):
             await self.disconnect()
             return False
 
-        self._event_task = asyncio.create_task(self._event_loop())
         self._mark_connected()
+        self._event_task = asyncio.create_task(self._event_loop())
         logger.info("Zulip: connected to %s as %s", self._site, self._email)
         return True
 
@@ -328,9 +329,14 @@ async def _send_with_config(
 
     payload: dict[str, Any]
     if str(target).startswith("dm:"):
+        recipient = str(target)[3:]
+        if recipient.isdigit():
+            to_value = json.dumps([int(recipient)])
+        else:
+            to_value = json.dumps([recipient])
         payload = {
             "type": "private",
-            "to": str(target)[3:],
+            "to": to_value,
             "content": message,
         }
     else:
