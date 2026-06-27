@@ -1,0 +1,42 @@
+name: zulip-platform
+label: Zulip
+kind: platform
+version: 1.0.0
+description: >
+  Zulip gateway adapter for Hermes Agent. Connects to a self-hosted or cloud
+  Zulip organization via the Zulip REST/events API.
+author: Nous Research
+requires_env:
+  - name: ZULIP_SITE
+    description: "Zulip organization URL, e.g. https://zulip.example.com"
+    prompt: "Zulip site URL"
+    password: false
+  - name: ZULIP_EMAIL
+    description: "Zulip bot email address"
+    prompt: "Zulip bot email"
+    password: false
+  - name: ZULIP_API_KEY
+    description: "Zulip bot API key"
+    prompt: "Zulip bot API key"
+    password: true
+optional_env:
+  - name: ZULIP_ALLOWED_USERS
+    description: "Comma-separated Zulip delivery emails allowed to talk to Hermes"
+    prompt: "Allowed Zulip users"
+    password: false
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: "Allow any Zulip user to talk to Hermes"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: ZULIP_HOME_CHANNEL
+    description: "Default stream ID or stream name for cron/notification delivery"
+    prompt: "Zulip home stream"
+    password: false
+  - name: ZULIP_HOME_CHANNEL_NAME
+    description: "Default Zulip topic/name for cron/notification delivery"
+    prompt: "Zulip home topic/name"
+    password: false
+  - name: ZULIP_VERIFY_SSL
+    description: "Verify Zulip TLS certificate (false for self-signed internal installs)"
+    prompt: "Verify TLS? (true/false)"
+    password: false
