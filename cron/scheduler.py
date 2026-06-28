@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -251,6 +252,38 @@ SILENT_MARKER = "[SILENT]"
 # NOT when a token merely appears mid-sentence in a genuine report (e.g.
 # "I considered staying [SILENT] but here is the summary…" must deliver).
 _CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
+
+
+_RUN_LEDGER_PATH = get_hermes_home() / "cron" / "run-ledger.jsonl"
+
+
+def _append_run_ledger(
+    job: dict,
+    *,
+    status: str,
+    delivered: bool,
+    delivery_error: str | None = None,
+    error: str | None = None,
+    output_path: str | None = None,
+) -> None:
+    """Append one cron tick receipt to the profile-local run ledger."""
+    try:
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "job_id": str(job.get("id") or ""),
+            "name": str(job.get("name") or job.get("id") or ""),
+            "status": status,
+            "delivered": bool(delivered),
+            "deliver": _normalize_deliver_value(job.get("deliver", "local")),
+            "delivery_error": delivery_error,
+            "error": error,
+            "output_path": str(output_path) if output_path is not None else None,
+        }
+        _RUN_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _RUN_LEDGER_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        logger.warning("Failed to append cron run ledger", exc_info=True)
 
 
 def _is_cron_silence_response(text: str) -> bool:
@@ -2808,11 +2841,33 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
+        if success and not should_deliver:
+            ledger_status = "silent"
+            ledger_delivered = False
+        elif success and delivery_error:
+            ledger_status = "delivery_error"
+            ledger_delivered = False
+        elif success:
+            ledger_status = "ok"
+            ledger_delivered = deliver_value != "local"
+        else:
+            ledger_status = "error"
+            ledger_delivered = delivery_error is None and deliver_value != "local" and should_deliver
+        _append_run_ledger(
+            job,
+            status=ledger_status,
+            delivered=ledger_delivered,
+            delivery_error=delivery_error,
+            error=error,
+            output_path=output_file,
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         mark_job_run(job["id"], False, str(e))
+        _append_run_ledger(job, status="error", delivered=False, error=str(e))
         return False
 
 

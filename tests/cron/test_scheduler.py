@@ -2447,6 +2447,45 @@ class TestSilentDelivery:
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
 
+    def test_run_ledger_records_successful_delivery(self, tmp_path, monkeypatch):
+        import cron.scheduler as sched
+
+        ledger = tmp_path / "run-ledger.jsonl"
+        monkeypatch.setattr(sched, "_RUN_LEDGER_PATH", ledger)
+        job = self._make_job()
+        job["deliver"] = "telegram:123"
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "hello", None)), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert rows[-1]["job_id"] == "monitor-job"
+        assert rows[-1]["status"] == "ok"
+        assert rows[-1]["delivered"] is True
+        assert rows[-1]["deliver"] == "telegram:123"
+
+    def test_run_ledger_records_silent_without_delivery(self, tmp_path, monkeypatch):
+        import cron.scheduler as sched
+
+        ledger = tmp_path / "run-ledger.jsonl"
+        monkeypatch.setattr(sched, "_RUN_LEDGER_PATH", ledger)
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert rows[-1]["status"] == "silent"
+        assert rows[-1]["delivered"] is False
+
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
