@@ -142,6 +142,7 @@ def _apply_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> dict:
 
 class ZulipAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    supports_code_blocks = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform("zulip"))
@@ -300,6 +301,28 @@ class ZulipAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(result.get("error", "Zulip send failed")))
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        del chat_id, finalize
+        if not message_id:
+            return SendResult(success=False, error="Zulip edit: message_id is required")
+        try:
+            chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, self.message_len_fn)
+            result = await self._request(
+                "PATCH",
+                f"/api/v1/messages/{message_id}",
+                data={"content": chunks[0] if chunks else ""},
+            )
+            return SendResult(success=True, message_id=str(message_id), raw_response=result)
+        except Exception as e:
+            return SendResult(success=False, message_id=str(message_id), error=str(e))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
