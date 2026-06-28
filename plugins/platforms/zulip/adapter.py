@@ -23,7 +23,13 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    resolve_channel_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +293,7 @@ class ZulipAdapter(BasePlatformAdapter):
         sender_name = message.get("sender_full_name") or sender_email
         topic = message.get("subject") or message.get("topic") or "general"
 
+        channel_prompt = None
         if msg_type == "private":
             chat_id = f"dm:{message.get('sender_id')}"
             chat_name = sender_name
@@ -296,6 +303,8 @@ class ZulipAdapter(BasePlatformAdapter):
             chat_id = str(stream_id or message.get("display_recipient") or "")
             chat_name = str(message.get("display_recipient") or chat_id)
             chat_type = "group"
+            topic_key = f"{chat_id}:{topic}" if chat_id and topic else None
+            channel_prompt = resolve_channel_prompt(self._extra, topic_key or "", chat_id)
 
         source = self.build_source(
             chat_id=chat_id,
@@ -311,6 +320,7 @@ class ZulipAdapter(BasePlatformAdapter):
             source=source,
             message_id=str(message.get("id") or int(time.time() * 1000)),
             timestamp=datetime.fromtimestamp(message.get("timestamp", time.time()), tz=timezone.utc),
+            channel_prompt=channel_prompt,
         )
         await self.handle_message(gateway_event)
 

@@ -46,6 +46,91 @@ async def test_edit_message_requires_message_id() -> None:
     assert "message_id is required" in (result.error or "")
 
 
+
+@pytest.mark.asyncio
+async def test_channel_prompt_uses_stream_topic_override() -> None:
+    adapter = _zulip.ZulipAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "site": "https://zulip.test",
+                "channel_prompts": {
+                    "10": "stream voice",
+                    "10:Sanctuary": "topic voice",
+                },
+            },
+        )
+    )
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    adapter.handle_message = fake_handle
+    adapter._own_user_id = 99
+
+    await adapter._handle_event(
+        {
+            "type": "message",
+            "message": {
+                "id": 123,
+                "type": "stream",
+                "stream_id": 10,
+                "display_recipient": "Sanctuary",
+                "subject": "Sanctuary",
+                "sender_id": 42,
+                "sender_email": "rovin@example.test",
+                "sender_full_name": "Rovin",
+                "content": "hello",
+                "timestamp": 1782660000,
+            },
+        }
+    )
+
+    assert len(handled) == 1
+    assert handled[0].channel_prompt == "topic voice"
+
+
+@pytest.mark.asyncio
+async def test_channel_prompt_falls_back_to_stream_prompt() -> None:
+    adapter = _zulip.ZulipAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "site": "https://zulip.test",
+                "channel_prompts": {"10": "stream voice"},
+            },
+        )
+    )
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    adapter.handle_message = fake_handle
+    adapter._own_user_id = 99
+
+    await adapter._handle_event(
+        {
+            "type": "message",
+            "message": {
+                "id": 124,
+                "type": "stream",
+                "stream_id": 10,
+                "display_recipient": "Sanctuary",
+                "subject": "other-topic",
+                "sender_id": 42,
+                "sender_email": "rovin@example.test",
+                "sender_full_name": "Rovin",
+                "content": "hello",
+                "timestamp": 1782660000,
+            },
+        }
+    )
+
+    assert len(handled) == 1
+    assert handled[0].channel_prompt == "stream voice"
+
 def test_zulip_adapter_supports_markdown_code_blocks() -> None:
     adapter = _zulip.ZulipAdapter(PlatformConfig(enabled=True, extra={"site": "https://zulip.test"}))
 
