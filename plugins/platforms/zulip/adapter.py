@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 10000
 EVENT_TYPES = ["message"]
+PRESENCE_INTERVAL_SECONDS = 60.0
 
 
 def _truthy(value: Any) -> bool:
@@ -156,6 +157,8 @@ class ZulipAdapter(BasePlatformAdapter):
         self._queue_id: Optional[str] = None
         self._last_event_id: Optional[int] = None
         self._own_user_id: Optional[int] = None
+        self._presence_task: Optional[asyncio.Task] = None
+        self._typing_targets: dict[str, dict[str, Any]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not HTTPX_AVAILABLE:
@@ -184,12 +187,20 @@ class ZulipAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         self._event_task = asyncio.create_task(self._event_loop())
+        self._presence_task = asyncio.create_task(self._presence_loop())
         logger.info("Zulip: connected to %s as %s", self._site, self._email)
         return True
 
     async def disconnect(self) -> None:
         self._running = False
         self._mark_disconnected()
+        if self._presence_task:
+            self._presence_task.cancel()
+            try:
+                await self._presence_task
+            except asyncio.CancelledError:
+                pass
+            self._presence_task = None
         if self._event_task:
             self._event_task.cancel()
             try:
@@ -239,6 +250,27 @@ class ZulipAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("Zulip: event loop error: %s", e)
                 await asyncio.sleep(5)
+
+    async def _presence_loop(self) -> None:
+        while self._running:
+            try:
+                await self._update_presence("active")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("Zulip: presence heartbeat failed: %s", e)
+            await asyncio.sleep(PRESENCE_INTERVAL_SECONDS)
+
+    async def _update_presence(self, status: str) -> None:
+        await self._request(
+            "POST",
+            "/api/v1/users/me/presence",
+            data={
+                "status": status,
+                "ping_only": "true",
+                "new_user_input": "false",
+            },
+        )
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         if event.get("type") != "message":
@@ -324,8 +356,53 @@ class ZulipAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, message_id=str(message_id), error=str(e))
 
+    def _typing_payload(
+        self,
+        chat_id: str,
+        op: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        target = chat_id or _home_channel(self._extra)
+        if not target:
+            raise RuntimeError("Zulip typing: no target chat_id or ZULIP_HOME_CHANNEL configured")
+
+        if str(target).startswith("dm:"):
+            recipient = str(target)[3:]
+            if recipient.isdigit():
+                to_value = json.dumps([int(recipient)])
+            else:
+                to_value = json.dumps([recipient])
+            return {
+                "op": op,
+                "type": "direct",
+                "to": to_value,
+            }
+
+        if not str(target).isdigit():
+            raise RuntimeError(f"Zulip typing: stream target must be a stream_id, got {target!r}")
+
+        return {
+            "op": op,
+            "type": "stream",
+            "stream_id": int(str(target)),
+            "topic": str((metadata or {}).get("thread_id") or _home_topic(self._extra)),
+        }
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        return None
+        try:
+            payload = self._typing_payload(chat_id, "start", metadata if isinstance(metadata, dict) else None)
+            self._typing_targets[str(chat_id)] = payload
+            await self._request("POST", "/api/v1/typing", data=payload)
+        except Exception as e:
+            logger.debug("Zulip: send_typing failed: %s", e)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        try:
+            payload = dict(self._typing_targets.pop(str(chat_id), self._typing_payload(chat_id, "stop")))
+            payload["op"] = "stop"
+            await self._request("POST", "/api/v1/typing", data=payload)
+        except Exception as e:
+            logger.debug("Zulip: stop_typing failed: %s", e)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm" if str(chat_id).startswith("dm:") else "group"}
