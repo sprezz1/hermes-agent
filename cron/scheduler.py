@@ -257,6 +257,13 @@ _CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
 _RUN_LEDGER_PATH = get_hermes_home() / "cron" / "run-ledger.jsonl"
 
 
+def _ledger_json_default(value):
+    """Serialize path-like values that can leak in from scheduler helpers."""
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
 def _append_run_ledger(
     job: dict,
     *,
@@ -281,7 +288,15 @@ def _append_run_ledger(
         }
         _RUN_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _RUN_LEDGER_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            f.write(
+                json.dumps(
+                    row,
+                    default=_ledger_json_default,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
     except Exception:
         logger.warning("Failed to append cron run ledger", exc_info=True)
 

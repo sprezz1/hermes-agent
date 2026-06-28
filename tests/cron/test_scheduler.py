@@ -2468,6 +2468,24 @@ class TestSilentDelivery:
         assert rows[-1]["delivered"] is True
         assert rows[-1]["deliver"] == "telegram:123"
 
+    def test_run_ledger_serializes_path_like_values(self, tmp_path, monkeypatch):
+        import cron.scheduler as sched
+
+        ledger = tmp_path / "run-ledger.jsonl"
+        monkeypatch.setattr(sched, "_RUN_LEDGER_PATH", ledger)
+        job = self._make_job()
+        job["deliver"] = tmp_path / "target"
+        sched._append_run_ledger(
+            job,
+            status="ok",
+            delivered=True,
+            output_path=tmp_path / "out.md",
+        )
+
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert rows[-1]["deliver"] == str(tmp_path / "target")
+        assert rows[-1]["output_path"] == str(tmp_path / "out.md")
+
     def test_run_ledger_records_silent_without_delivery(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
