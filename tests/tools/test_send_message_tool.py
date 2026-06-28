@@ -231,6 +231,27 @@ class TestSendMessageTool:
         assert thread_id is None
         assert is_explicit is True
 
+    def test_zulip_stream_topic_target_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("zulip", "11:morning-boot")
+
+        assert chat_id == "11"
+        assert thread_id == "morning-boot"
+        assert is_explicit is True
+
+    def test_zulip_topic_preserves_spaces_and_colons(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("zulip", "13:Body & Mind: readiness")
+
+        assert chat_id == "13"
+        assert thread_id == "Body & Mind: readiness"
+        assert is_explicit is True
+
+    def test_zulip_bare_stream_id_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("zulip", "11")
+
+        assert chat_id == "11"
+        assert thread_id is None
+        assert is_explicit is True
+
     def test_ntfy_topic_target_bypasses_channel_directory(self):
         ntfy_platform = Platform("ntfy")
         ntfy_cfg = SimpleNamespace(enabled=True, token=None, extra={"topic": "hermes-in"})
