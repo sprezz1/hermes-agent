@@ -614,6 +614,96 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
     return rendered or fallback
 
 
+def _normalize_bank_id_list(value: Any) -> list[str]:
+    """Normalize a configured bank-id list while preserving order."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                raw_items = parsed
+            else:
+                raw_items = text.split(",")
+        else:
+            raw_items = text.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        bank_id = str(item).strip()
+        if not bank_id or bank_id in seen:
+            continue
+        seen.add(bank_id)
+        normalized.append(bank_id)
+    return normalized
+
+
+def _bank_route_key_candidates(
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    user_id: str = "",
+    session_id: str = "",
+) -> list[str]:
+    """Return most-specific to least-specific route keys for bank_routes."""
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in candidates:
+            candidates.append(value)
+
+    if platform and chat_id and thread_id:
+        add(f"{platform}:{chat_id}:{thread_id}")
+    if platform and chat_id:
+        add(f"{platform}:{chat_id}")
+    if platform and user_id:
+        add(f"{platform}:user:{user_id}")
+    if platform and session_id:
+        add(f"{platform}:session:{session_id}")
+    if platform:
+        add(platform)
+    return candidates
+
+
+def _resolve_routed_bank_id(
+    config: dict[str, Any],
+    fallback_bank_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    user_id: str = "",
+    session_id: str = "",
+) -> tuple[str, str]:
+    """Resolve the active bank from bank_routes, returning (bank_id, route_key)."""
+    routes = config.get("bank_routes") or {}
+    if not isinstance(routes, dict):
+        return fallback_bank_id, ""
+    for key in _bank_route_key_candidates(
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        session_id=session_id,
+    ):
+        routed = routes.get(key)
+        if routed:
+            return str(routed).strip() or fallback_bank_id, key
+    return fallback_bank_id, ""
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -707,11 +797,13 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        self._recall_extra_bank_ids: list[str] = []
 
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+        self._bank_route_key = ""
 
     @property
     def name(self) -> str:
@@ -983,6 +1075,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
+            {"key": "bank_routes", "description": "Optional mapping from platform/chat route keys to bank ids. Keys are matched most-specific first, e.g. matrix:!room:server, zulip:stream_id, matrix:user:@user:server, or platform."},
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
@@ -995,6 +1088,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
+            {"key": "recall_extra_bank_ids", "description": "Temporary reference banks to search after the active bank. Use only during migrations; remove when the unified bank is verified.", "default": ""},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
@@ -1295,6 +1389,15 @@ class HindsightMemoryProvider(MemoryProvider):
             user=self._user_id,
             session=self._session_id,
         )
+        self._bank_id, self._bank_route_key = _resolve_routed_bank_id(
+            self._config,
+            self._bank_id,
+            platform=self._platform,
+            chat_id=self._chat_id,
+            thread_id=self._thread_id,
+            user_id=self._user_id,
+            session_id=self._session_id,
+        )
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
@@ -1351,6 +1454,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._recall_extra_bank_ids = [
+            bank_id
+            for bank_id in _normalize_bank_id_list(self._config.get("recall_extra_bank_ids"))
+            if bank_id != self._bank_id
+        ]
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -1365,6 +1473,10 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Hindsight bank resolved from template %r: profile=%s workspace=%s platform=%s user=%s -> bank=%s",
                          self._bank_id_template, self._agent_identity, self._agent_workspace,
                          self._platform, self._user_id, self._bank_id)
+        if self._bank_route_key:
+            logger.info("Hindsight bank route matched %r -> %s", self._bank_route_key, self._bank_id)
+        if self._recall_extra_bank_ids:
+            logger.info("Hindsight recall fanout enabled: active=%s extras=%s", self._bank_id, self._recall_extra_bank_ids)
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
                      "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
@@ -1481,6 +1593,58 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _recall_bank_results(self, query: str, *, bank_id: str):
+        recall_kwargs: dict = {
+            "bank_id": bank_id,
+            "query": query,
+            "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        if self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        return self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+
+    def _recall_all_bank_results(self, query: str) -> list[tuple[str, Any]]:
+        banks = [self._bank_id, *self._recall_extra_bank_ids]
+        responses: list[tuple[str, Any]] = []
+        for bank_id in banks:
+            logger.debug(
+                "Hindsight recall: bank=%s, query_len=%d, budget=%s",
+                bank_id, len(query), self._budget,
+            )
+            responses.append((bank_id, self._recall_bank_results(query, bank_id=bank_id)))
+        return responses
+
+    @staticmethod
+    def _format_recall_responses(
+        responses: list[tuple[str, Any]],
+        *,
+        include_bank_labels: bool,
+        bullet: bool = False,
+    ) -> str:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for bank_id, resp in responses:
+            results = getattr(resp, "results", None) or []
+            for result in results:
+                text = getattr(result, "text", "") or ""
+                if not text:
+                    continue
+                key = text.strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if include_bank_labels:
+                    lines.append(f"[{bank_id}] {text}")
+                elif bullet:
+                    lines.append(f"- {text}")
+                else:
+                    lines.append(text)
+        return "\n".join(lines)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1502,21 +1666,14 @@ class HindsightMemoryProvider(MemoryProvider):
                     resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
                     text = resp.text or ""
                 else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
+                    responses = self._recall_all_bank_results(query)
+                    num_results = sum(len(getattr(resp, "results", None) or []) for _, resp in responses)
                     logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                    text = self._format_recall_responses(
+                        responses,
+                        include_bank_labels=bool(self._recall_extra_bank_ids),
+                        bullet=not bool(self._recall_extra_bank_ids),
+                    )
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
@@ -1731,23 +1888,17 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
+                responses = self._recall_all_bank_results(query)
+                num_results = sum(len(getattr(resp, "results", None) or []) for _, resp in responses)
                 logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
+                text = self._format_recall_responses(
+                    responses,
+                    include_bank_labels=bool(self._recall_extra_bank_ids),
+                    bullet=False,
+                )
+                if not text:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = [f"{i}. {line}" for i, line in enumerate(text.splitlines(), 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)

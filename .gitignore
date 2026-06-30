@@ -137,3 +137,7 @@ RELEASE_v*.md
 # Desktop demo-run scratch output (hermes writes demo/*.txt during recorded
 # walkthroughs). Throwaway artifacts, never part of the app.
 apps/desktop/demo/
+
+# Local Astra archive/runtime import. Contains logs, credentials, nested repos,
+# media, and personal knowledge files; keep it outside Hermes Agent source.
+/aerie/

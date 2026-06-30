@@ -25,6 +25,9 @@ from plugins.memory.hindsight import (
     _build_embedded_profile_env,
     _normalize_observation_scopes,
     _normalize_retain_tags,
+    _normalize_bank_id_list,
+    _bank_route_key_candidates,
+    _resolve_routed_bank_id,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
@@ -214,6 +217,45 @@ def test_normalize_retain_tags_accepts_csv_and_dedupes():
 def test_normalize_retain_tags_accepts_json_array_string():
     value = json.dumps(["agent:fakeassistantname", "source_system:hermes-agent"])
     assert _normalize_retain_tags(value) == ["agent:fakeassistantname", "source_system:hermes-agent"]
+
+
+def test_normalize_bank_id_list_accepts_csv_json_and_dedupes():
+    assert _normalize_bank_id_list("hermes, astra_main, hermes") == ["hermes", "astra_main"]
+    assert _normalize_bank_id_list(json.dumps(["hermes", "astra_work", "hermes"])) == [
+        "hermes",
+        "astra_work",
+    ]
+
+
+def test_bank_route_key_candidates_prefer_specific_room_thread():
+    assert _bank_route_key_candidates(
+        platform="matrix",
+        chat_id="!room:kingdom.local",
+        thread_id="$thread",
+        user_id="@rovin:kingdom.local",
+        session_id="s1",
+    ) == [
+        "matrix:!room:kingdom.local:$thread",
+        "matrix:!room:kingdom.local",
+        "matrix:user:@rovin:kingdom.local",
+        "matrix:session:s1",
+        "matrix",
+    ]
+
+
+def test_resolve_routed_bank_id_matches_room_before_platform():
+    config = {
+        "bank_routes": {
+            "matrix": "all_matrix",
+            "matrix:!room:kingdom.local": "room_bank",
+        }
+    }
+    assert _resolve_routed_bank_id(
+        config,
+        "fallback",
+        platform="matrix",
+        chat_id="!room:kingdom.local",
+    ) == ("room_bank", "matrix:!room:kingdom.local")
 
 
 def test_normalize_observation_scopes_empty_is_none():
@@ -714,6 +756,26 @@ class TestToolHandlers:
         p.handle_tool_call("hindsight_recall", {"query": "test"})
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["types"] == ["world", "experience"]
+
+    def test_recall_fans_out_to_extra_banks_after_active_bank(self, provider_with_config):
+        p = provider_with_config(
+            bank_id="astra_unified_v1",
+            recall_extra_bank_ids=["hermes", "astra_main"],
+        )
+
+        async def _arecall(**kwargs):
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=f"{kwargs['bank_id']} memory")]
+            )
+
+        p._client.arecall = AsyncMock(side_effect=_arecall)
+
+        result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "origin"}))
+
+        bank_calls = [call.kwargs["bank_id"] for call in p._client.arecall.call_args_list]
+        assert bank_calls == ["astra_unified_v1", "hermes", "astra_main"]
+        assert "[astra_unified_v1] astra_unified_v1 memory" in result["result"]
+        assert "[hermes] hermes memory" in result["result"]
 
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
@@ -1472,11 +1534,12 @@ class TestConfigSchema:
         keys = {f["key"] for f in schema}
         expected_keys = {
             "mode", "api_url", "api_key", "llm_provider", "llm_api_key",
-            "llm_model", "bank_id", "bank_id_template", "bank_mission", "bank_retain_mission",
+            "llm_model", "bank_id", "bank_id_template", "bank_routes",
+            "bank_mission", "bank_retain_mission",
             "recall_budget", "memory_mode", "recall_prefetch_method",
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
-            "recall_tags", "recall_tags_match",
+            "recall_tags", "recall_tags_match", "recall_extra_bank_ids",
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",
@@ -1627,6 +1690,80 @@ class TestBankIdTemplate:
         # No agent_identity passed — template renders to "hermes-" which collapses to "hermes"
         p.initialize(session_id="s1", hermes_home=str(tmp_path), platform="cli")
         assert p._bank_id == "hermes"
+
+
+class TestBankRoutes:
+    def test_staging_routes_matrix_rooms_and_lets_zulip_fall_through(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "k",
+            "api_url": "http://x",
+            "bank_id": "astra_unified_v1",
+            "bank_routes": {
+                "matrix:!QciTuSXGfxseWDesXs:kingdom.local": "astra_sanctuary",
+                "matrix:!VnlJykbyCHTxXnJBtg:kingdom.local": "astra_main",
+                "matrix:!unjRRLTWiWjatHxHoQ:kingdom.local": "astra_library",
+                "matrix:!baBUVDtNpRpDSvcsUB:kingdom.local": "astra_work",
+            },
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        matrix = HindsightMemoryProvider()
+        matrix.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="matrix",
+            chat_id="!VnlJykbyCHTxXnJBtg:kingdom.local",
+        )
+        assert matrix._bank_id == "astra_main"
+        assert matrix._bank_route_key == "matrix:!VnlJykbyCHTxXnJBtg:kingdom.local"
+
+        zulip = HindsightMemoryProvider()
+        zulip.initialize(
+            session_id="s2",
+            hermes_home=str(tmp_path),
+            platform="zulip",
+            chat_id="37",
+        )
+        assert zulip._bank_id == "astra_unified_v1"
+        assert zulip._bank_route_key == ""
+
+    def test_final_unified_config_routes_matrix_and_zulip_to_same_bank(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "k",
+            "api_url": "http://x",
+            "bank_id": "astra_unified_v1",
+            "bank_routes": {},
+            "recall_extra_bank_ids": [],
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        matrix = HindsightMemoryProvider()
+        matrix.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="matrix",
+            chat_id="!VnlJykbyCHTxXnJBtg:kingdom.local",
+        )
+        zulip = HindsightMemoryProvider()
+        zulip.initialize(
+            session_id="s2",
+            hermes_home=str(tmp_path),
+            platform="zulip",
+            chat_id="37",
+        )
+
+        assert matrix._bank_id == "astra_unified_v1"
+        assert zulip._bank_id == "astra_unified_v1"
+        assert matrix._recall_extra_bank_ids == []
+        assert zulip._recall_extra_bank_ids == []
 
 
 # ---------------------------------------------------------------------------
